@@ -156,7 +156,7 @@ def verify_access_vlan(task: Task, interface: str, vlan_id: str) -> bool:
         return False
 
 def verify_trunk_vlan(task: Task, interface: str, vlan_id: str) -> bool:
-    """Verify trunk allows the VLAN using switchport status (with minimal fallback)"""
+    """Verify trunk allows the VLAN with robust error handling"""
     try:
         # Primary method: structured switchport data
         command = f"show interfaces {interface} switchport"
@@ -168,65 +168,75 @@ def verify_trunk_vlan(task: Task, interface: str, vlan_id: str) -> bool:
             enable=True
         )
         
+        # Handle TextFSM parse failure (raw string output)
+        if isinstance(result.result, str):
+            print("[DEBUG] TextFSM parsing failed, using raw output")
+            if "trunking" in result.result.lower() and "vlans allowed: all" in result.result.lower():
+                return True
+            return str(vlan_id) in result.result
+        
+        # Handle successful TextFSM parsing
         if result.result and isinstance(result.result, list):
             sw_data = result.result[0]
             
-            # 1. Verify port is actually trunking
+            # Verify trunk mode
             if sw_data.get('mode', '').lower() != 'trunk':
-                print(f"[DEBUG] Port {interface} is not in trunk mode")
                 return False
             
-            # 2. Check if trunk allows ALL VLANs
+            # Check for ALL VLANs allowed
             if any(field == 'ALL' 
                   for field in [sw_data.get('trunking_vlans', ''), 
                                sw_data.get('vlans_allowed', '')]):
-                print(f"[DEBUG] Trunk allows all VLANs")
                 return True
             
-            # 3. Check specific VLAN in allowed lists
+            # Check specific VLAN in allowed lists
             for field in ['trunking_vlans', 'vlans_allowed']:
-                if _is_vlan_in_list(sw_data.get(field, ''), vlan_id):
-                    print(f"[DEBUG] VLAN {vlan_id} found in {field}")
+                vlans = sw_data.get(field, '')
+                if vlans and _is_vlan_in_list(vlans, vlan_id):
                     return True
             
             return False
 
     except Exception as e:
-        print(f"[ERROR] Switchport check failed, falling back to config: {str(e)}")
+        print(f"[ERROR] Switchport check failed: {str(e)}")
     
     # Minimal fallback (only checks for unrestricted trunks)
     try:
         command = f"show running-config interface {interface}"
-        result = task.run(task=netmiko_send_command,
-                         command_string=command,
-                         enable=True)
+        result = task.run(
+            task=netmiko_send_command,
+            command_string=command,
+            enable=True
+        )
         config = result.result.lower()
         
-        # Only check for unrestricted trunks in fallback
         if ("switchport mode trunk" in config and 
             "switchport trunk allowed vlan" not in config):
-            print(f"[DEBUG] Fallback: Trunk with no VLAN restrictions")
             return True
             
     except Exception as e:
         print(f"[ERROR] Fallback config check failed: {str(e)}")
     
-    print(f"[DEBUG] VLAN {vlan_id} not allowed on trunk {interface}")
     return False
 
 def _is_vlan_in_list(vlan_str: str, target_vlan: str) -> bool:
-    """Helper to parse VLAN lists (1,3-5,10)"""
-    if not vlan_str:
-        return False
-        
-    for part in vlan_str.split(','):
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            if start <= int(target_vlan) <= end:
+    """Helper to safely parse VLAN lists"""
+    try:
+        if not vlan_str:
+            return False
+            
+        for part in str(vlan_str).split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                if start <= int(target_vlan) <= end:
+                    return True
+            elif part == str(target_vlan):
                 return True
-        elif part == target_vlan:
-            return True
-    return False
+        return False
+    except Exception as e:
+        print(f"[ERROR] VLAN list parsing failed: {str(e)}")
+        return False
 
 def trace_path_to_router(nr, start_device: str) -> List[str]:
     print('\n[DEBUG] Tracing path to router...')
@@ -348,134 +358,252 @@ def trace_path_to_router(nr, start_device: str) -> List[str]:
     
     return path
 
-def verify_vlan_path(initial_switch: str, target_port: str, vlan_id: str) -> Tuple[bool, str, List[str]]:
-    """Main verification function with full path checking"""
-    print("\n[DEBUG] Starting VLAN path verification")
-    print(f"[DEBUG] Initial switch: {initial_switch}")
-    print(f"[DEBUG] Target port: {target_port}")
-    print(f"[DEBUG] VLAN ID: {vlan_id}")
-    
+def verify_vlan_path(initial_switch: str, target_port: str, vlan_id: str) -> Tuple[bool, str, List[str], Dict[str, str]]:
+    """Modified to check all nodes regardless of failures"""
+    print("\n[INFO] Starting comprehensive VLAN path verification")
     nr = InitNornir(config_file="config.yaml")
+    verification_results = {}
+    overall_success = True
+    failure_reason = ""
+    
     path = trace_path_to_router(nr, initial_switch)
     
     if not path:
-        print("[ERROR] No path found to router")
-        return False, "Failed to trace path to router", []
-    
-    print("\n[DEBUG] Beginning path verification")
+        return False, "No path found to router", [], {}
+
+    print("\n[INFO] Beginning comprehensive verification")
     for i, device_ip in enumerate(path):
         print('\n' + '='*50)
-        print(f"[DEBUG] Verifying device {i+1}/{len(path)}: {device_ip}")
+        print(f"[DEVICE] Verifying device {i+1}/{len(path)}: {device_ip}")
         print('='*50)
-        device = nr.inventory.hosts[device_ip]
         
-        # Verify VLAN exists on device
-        print(f"[DEBUG] Checking if VLAN {vlan_id} exists on {device_ip}")
-        vlan_exists = nr.filter(name=device_ip).run(task=verify_vlan_exists, vlan_id=vlan_id)[device_ip].result
+        device_result = {}
+        
+        # Verify VLAN exists (all devices)
+        vlan_exists = nr.filter(name=device_ip).run(
+            task=verify_vlan_exists,
+            vlan_id=vlan_id
+        )[device_ip].result
+        
         if not vlan_exists:
-            print(f"[ERROR] VLAN {vlan_id} missing on {device_ip}")
-            return False, f"VLAN {vlan_id} missing on {device_ip}", path
-        print(f"[DEBUG] VLAN {vlan_id} exists on {device_ip}")
-        
+            msg = f"VLAN {vlan_id} missing"
+            device_result['vlan_status'] = msg
+            overall_success = False
+            if not failure_reason:
+                failure_reason = msg
+            print(f"[FAIL] {msg}")
+        else:
+            device_result['vlan_status'] = "VLAN exists"
+            print(f"[PASS] VLAN {vlan_id} present")
+
         # First device checks access port
         if i == 0:
-            print(f"[DEBUG] Verifying access port {target_port} on edge switch")
             access_ok = nr.filter(name=device_ip).run(
-                task=verify_access_vlan, 
-                interface=target_port, 
+                task=verify_access_vlan,
+                interface=target_port,
                 vlan_id=vlan_id
             )[device_ip].result
+            
             if not access_ok:
-                print(f"[ERROR] Port {target_port} not in VLAN {vlan_id} on {device_ip}")
-                return False, f"Port {target_port} not in VLAN {vlan_id} on {device_ip}", path
-            print(f"[DEBUG] Access port {target_port} verified on {device_ip}")
-        
-        # Intermediate devices check trunk ports
-        elif i < len(path) - 1:
-            next_device = path[i+1]
-            print(f"[DEBUG] Finding uplink port to next device: {next_device}")
-            uplink_port = nr.filter(name=device_ip).run(
-                task=find_uplink_port,
-                neighbor_ip=next_device
-            )[device_ip].result
-            
-            if not uplink_port:
-                print(f"[ERROR] Could not find uplink port on {device_ip} to {next_device}")
-                return False, f"Could not find uplink port on {device_ip}", path
-            
-            print(f"[DEBUG] Found uplink port: {uplink_port}")
-            print(f"[DEBUG] Verifying trunk port {uplink_port} allows VLAN {vlan_id}")
-                
-            trunk_ok = nr.filter(name=device_ip).run(
-                task=verify_trunk_vlan,
-                interface=uplink_port,
-                vlan_id=vlan_id
-            )[device_ip].result
-            if not trunk_ok:
-                print(f"[ERROR] VLAN {vlan_id} not allowed on trunk {uplink_port} of {device_ip}")
-                return False, f"VLAN {vlan_id} not allowed on trunk {uplink_port} of {device_ip}", path
-            print(f"[DEBUG] Trunk port {uplink_port} verified on {device_ip}")
-    
-    print("\n[DEBUG] VLAN path verification completed successfully")
-    return True, f"VLAN {vlan_id} path verified successfully from {initial_switch} to router", path
+                msg = f"Port {target_port} not in VLAN"
+                device_result['port_status'] = msg
+                overall_success = False
+                if not failure_reason:
+                    failure_reason = msg
+                print(f"[FAIL] {msg}")
+            else:
+                device_result['port_status'] = "Port configured"
+                print(f"[PASS] Access port correct")
 
-def visualize_path(path: List[str], failure_node: str = None):
-    """Generate network path diagram with failure points highlighted"""
-    print("\n[DEBUG] Generating network path visualization")
-    G = nx.Graph()
+        # Intermediate devices check trunk ports
+                # All devices except the first (access port check) should check trunk
+        if i > 0:
+            if i < len(path):
+                next_device = path[i] if i == len(path) - 1 else path[i+1]
+                uplink_port = nr.filter(name=device_ip).run(
+                    task=find_uplink_port,
+                    neighbor_ip=next_device
+                )[device_ip].result
+
+                if uplink_port:
+                    trunk_ok = nr.filter(name=device_ip).run(
+                        task=verify_trunk_vlan,
+                        interface=uplink_port,
+                        vlan_id=vlan_id
+                    )[device_ip].result
+
+                    if not trunk_ok:
+                        msg = f"VLAN blocked on {uplink_port}"
+                        device_result['trunk_status'] = msg
+                        overall_success = False
+                        if not failure_reason:
+                            failure_reason = msg
+                        print(f"[FAIL] {msg}")
+                    else:
+                        device_result['trunk_status'] = f"Trunk {uplink_port} OK"
+                        print(f"[PASS] Trunk verified")
+                else:
+                    msg = f"No uplink to {next_device}"
+                    device_result['trunk_status'] = msg
+                    overall_success = False
+                    if not failure_reason:
+                        failure_reason = msg
+                    print(f"[FAIL] {msg}")
+
+
+        # Router gets special status
+        if device_ip == path[-1]:
+            device_result['role'] = "Router endpoint"
+            
+        # Combine all status messages
+        verification_results[device_ip] = "\n".join(
+            f"{k}: {v}" for k,v in device_result.items()
+        )
+
+    # Final message
+    if overall_success:
+        final_msg = f"VLAN {vlan_id} path fully verified"
+    else:
+        final_msg = f"VLAN path issues detected: {failure_reason}"
+
+    print("\n[SUMMARY] Verification complete")
+    for device, status in verification_results.items():
+        print("{}: {}".format(device, status.replace('\n', ' | ')))
     
-    # Add edges to the graph
-    for i in range(len(path)-1):
-        G.add_edge(path[i], path[i+1])
-    
-    plt.figure(figsize=(10, 6))
-    pos = nx.spring_layout(G)
-    
-    # Determine node colors - red for failure point and beyond
+    return overall_success, final_msg, path, verification_results
+
+def visualize_path(path: List[str], verification_results: Dict[str, str]):
+    """Enhanced visualization with straight-line layout and full status display"""
+    plt.ioff()  # Turn off interactive mode
+
+    G = nx.path_graph(path)
+    plt.figure(figsize=(14, 8))
+
+    # Node styling and labels
     node_colors = []
-    failure_found = False
+    detailed_labels = {}
+
     for node in G.nodes():
-        if node == failure_node:
-            failure_found = True
-        node_colors.append('red' if failure_found else 'skyblue')
-    
-    # Draw the graph
-    nx.draw(G, pos, 
-            with_labels=True, 
-            node_size=2000, 
-            node_color=node_colors, 
-            font_size=10,
-            edge_color='gray')
-    
-    plt.title("Network Path Verification")
-    plt.show()
+        raw_result = verification_results.get(node, "")
+        result = raw_result.lower()
+
+        # Decide status
+        if "vlan exists" in result and ("port configured" in result or ("trunk" in result and "blocked" not in result)):
+            color = "lightgreen"
+            status_text = "Pass"
+        elif "vlan missing" in result or "blocked" in result or "not in vlan" in result:
+            color = "red"
+            status_text = "Fail"
+        elif raw_result == "":
+            color = "gray"
+            status_text = "Unknown"
+        else:
+            color = "gray"
+            status_text = "Unknown"
+
+        node_colors.append(color)
+
+        # Build label with failure reason if needed
+        label_lines = [node, status_text]
+        if status_text == "Fail":
+            fail_reasons = [
+                line for line in raw_result.split("\n")
+                if "missing" in line.lower() or "blocked" in line.lower() or "not in vlan" in line.lower()
+            ]
+            label_lines.extend(fail_reasons)
+
+        detailed_labels[node] = "\n".join(label_lines)
+
+    # Straight-line layout
+    pos = {node: (i, 0) for i, node in enumerate(G.nodes())}
+
+    # Draw elements
+    nx.draw_networkx_nodes(
+        G, pos,
+        node_color=node_colors,
+        node_size=3000,
+        edgecolors="black",
+        linewidths=2
+    )
+
+    nx.draw_networkx_edges(
+        G, pos,
+        width=3,
+        edge_color="steelblue",
+        arrows=True,
+        arrowstyle="-|>",
+        arrowsize=20
+    )
+
+    # Node labels (just the node names above)
+    nx.draw_networkx_labels(
+        G, pos,
+        font_size=10,
+        font_weight="bold",
+        verticalalignment="center"
+    )
+
+    # Status/detailed labels just below nodes
+    pos_status = {k: (v[0], v[1]-0.15) for k, v in pos.items()}
+    nx.draw_networkx_labels(
+        G, pos_status,
+        labels=detailed_labels,
+        font_size=8,
+        font_color="black",
+        bbox=dict(
+            facecolor='white',
+            alpha=0.8,
+            edgecolor='lightgray',
+            boxstyle="round,pad=0.3"
+        )
+    )
+
+    # Legend
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label='Pass',
+                   markerfacecolor='lightgreen', markersize=15),
+        plt.Line2D([0], [0], marker='o', color='w', label='Fail',
+                   markerfacecolor='red', markersize=15),
+        plt.Line2D([0], [0], marker='o', color='w', label='Unknown',
+                   markerfacecolor='gray', markersize=15)
+    ]
+    plt.legend(
+        handles=legend_elements,
+        loc='upper right',
+        fontsize=10,
+        title="Node Status",
+        title_fontsize=12
+    )
+
+    plt.title("VLAN Path Verification - Full Path Analysis", pad=25, fontsize=14)
+    plt.axis('off')
+    plt.tight_layout()
+
+    # Show and restore
+    plt.show(block=True)
+    plt.ion()
+
 
 def main():
-    # Example usage
-    initial_switch = "172.17.57.243"
+    initial_switch = "172.17.57.243"  # Example starting switch IP
     target_port = "GigabitEthernet1/0/10"
     vlan_id = "5"
     
-    print("\n[INFO] Starting VLAN path verification script")
-    success, message, path = verify_vlan_path(initial_switch, target_port, vlan_id)
+    # Correct unpacking of all 4 return values
+    success, message, path, results = verify_vlan_path(
+        initial_switch,
+        target_port,
+        vlan_id
+    )
     
     print("\n" + "="*50)
-    print(f"VLAN Path Verification Result: {'SUCCESS' if success else 'FAILURE'}")
+    print(f"Verification {'SUCCEEDED' if success else 'FAILED'}")
     print("="*50)
-    print(f"Message: {message}")
-    print(f"Path traced: {' -> '.join(path)}")
+    print(f"Path: {' → '.join(path)}")
+    print(f"Status: {message}")
     
     if path:
-        # Determine failure node from message if verification failed
-        failure_node = None
-        if not success:
-            # Extract the failure node from the error message
-            for node in path:
-                if node in message:
-                    failure_node = node
-                    break
-        
-        visualize_path(path, failure_node)
+        visualize_path(path, results)
 
 if __name__ == "__main__":
     main()
