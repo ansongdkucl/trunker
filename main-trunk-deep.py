@@ -5,6 +5,8 @@ from typing import Dict, List, Tuple, Optional
 import networkx as nx
 import matplotlib.pyplot as plt
 import re
+import textwrap
+
 
 def get_lldp_neighbors(task: Task) -> List[Dict]:
     """Collect LLDP neighbor information in a vendor-neutral way"""
@@ -473,121 +475,119 @@ def verify_vlan_path(initial_switch: str, target_port: str, vlan_id: str) -> Tup
     return overall_success, final_msg, path, verification_results
 
 def visualize_path(path: List[str], verification_results: Dict[str, str]):
-    """Enhanced visualization with straight-line layout and full status display"""
-    plt.ioff()  # Turn off interactive mode
+    """
+    Visualize VLAN path with guaranteed label visibility by taking manual
+    control of the plot's layout and padding.
+    """
+    if not path:
+        print("[WARNING] Cannot visualize an empty path.")
+        return
 
+    plt.ioff()
+    fig, ax = plt.subplots(figsize=(18, 12)) # Use subplots for better axis control
+
+    # Create graph
     G = nx.path_graph(path)
-    plt.figure(figsize=(14, 8))
-
-    # Node styling and labels
+    
+    # --- 1. Node Styling and Label Preparation ---
     node_colors = []
-    detailed_labels = {}
-
+    device_labels = {}
+    status_labels = {}
+    
     for node in G.nodes():
-        raw_result = verification_results.get(node, "")
-        result = raw_result.lower()
-
-        # Decide status
-        if "vlan exists" in result and ("port configured" in result or ("trunk" in result and "blocked" not in result)):
+        raw_result = verification_results.get(node, "Status: Unknown")
+        
+        # Determine node color based on verification result
+        if "VLAN exists" in raw_result and ("Port configured" in raw_result or ("Trunk" in raw_result and "blocked" not in raw_result.lower())):
             color = "lightgreen"
-            status_text = "Pass"
-        elif "vlan missing" in result or "blocked" in result or "not in vlan" in result:
+        elif "missing" in raw_result.lower() or "blocked" in raw_result.lower() or "not in vlan" in raw_result.lower():
             color = "red"
-            status_text = "Fail"
-        elif raw_result == "":
-            color = "gray"
-            status_text = "Unknown"
         else:
-            color = "gray"
-            status_text = "Unknown"
-
+            color = "khaki" # Use khaki for unknown/partial status
+        
         node_colors.append(color)
+        device_labels[node] = node
+        
+        # Format the status label for clarity
+        status_text = raw_result.replace('\n', ' | ')
+        status_labels[node] = '\n'.join(textwrap.wrap(status_text, width=25)) # Wrap long text
 
-        # Build label with failure reason if needed
-        label_lines = [node, status_text]
-        if status_text == "Fail":
-            fail_reasons = [
-                line for line in raw_result.split("\n")
-                if "missing" in line.lower() or "blocked" in line.lower() or "not in vlan" in line.lower()
-            ]
-            label_lines.extend(fail_reasons)
+    # --- 2. Drawing Elements ---
+    pos = {node: (i, 0) for i, node in enumerate(path)}
 
-        detailed_labels[node] = "\n".join(label_lines)
-
-    # Straight-line layout
-    pos = {node: (i, 0) for i, node in enumerate(G.nodes())}
-
-    # Draw elements
     nx.draw_networkx_nodes(
-        G, pos,
+        G, pos, ax=ax,
         node_color=node_colors,
-        node_size=3000,
-        edgecolors="black",
-        linewidths=2
+        node_size=6000,
+        edgecolors='black',
+        linewidths=1.5
     )
-
+    
     nx.draw_networkx_edges(
-        G, pos,
+        G, pos, ax=ax,
         width=3,
-        edge_color="steelblue",
+        edge_color='steelblue',
         arrows=True,
-        arrowstyle="-|>",
-        arrowsize=20
+        arrowstyle='-|>',
+        arrowsize=25
     )
-
-    # Node labels (just the node names above)
+    
+    # Draw device names (inside the node)
     nx.draw_networkx_labels(
-        G, pos,
+        G, pos, ax=ax,
+        labels=device_labels,
+        font_size=12,
+        font_weight='bold',
+        font_color='black'
+    )
+    
+    # Draw status info (below the node)
+    status_pos = {k: (v[0], v[1] - 0.15) for k, v in pos.items()}
+    nx.draw_networkx_labels(
+        G, status_pos, ax=ax,
+        labels=status_labels,
         font_size=10,
-        font_weight="bold",
-        verticalalignment="center"
+        font_color='black',
+        verticalalignment='top',
+        bbox={'boxstyle': 'round,pad=0.5', 'facecolor': 'white', 'edgecolor': 'gray', 'alpha': 0.9}
     )
 
-    # Status/detailed labels just below nodes
-    pos_status = {k: (v[0], v[1]-0.15) for k, v in pos.items()}
-    nx.draw_networkx_labels(
-        G, pos_status,
-        labels=detailed_labels,
-        font_size=8,
-        font_color="black",
-        bbox=dict(
-            facecolor='white',
-            alpha=0.8,
-            edgecolor='lightgray',
-            boxstyle="round,pad=0.3"
-        )
-    )
-
-    # Legend
+    # --- 3. Layout, Padding, and Finalization (KEY FIXES) ---
+    
+    # Add a title and legend
+    ax.set_title("VLAN Path Verification", fontsize=20, pad=20)
     legend_elements = [
-        plt.Line2D([0], [0], marker='o', color='w', label='Pass',
-                   markerfacecolor='lightgreen', markersize=15),
-        plt.Line2D([0], [0], marker='o', color='w', label='Fail',
-                   markerfacecolor='red', markersize=15),
-        plt.Line2D([0], [0], marker='o', color='w', label='Unknown',
-                   markerfacecolor='gray', markersize=15)
+        plt.Line2D([0], [0], marker='o', color='w', label='Pass', markerfacecolor='lightgreen', markersize=15),
+        plt.Line2D([0], [0], marker='o', color='w', label='Fail', markerfacecolor='red', markersize=15),
+        plt.Line2D([0], [0], marker='o', color='w', label='Unknown/Partial', markerfacecolor='khaki', markersize=15)
     ]
-    plt.legend(
-        handles=legend_elements,
-        loc='upper right',
-        fontsize=10,
-        title="Node Status",
-        title_fontsize=12
-    )
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=12)
 
-    plt.title("VLAN Path Verification - Full Path Analysis", pad=25, fontsize=14)
+    # Manually expand the plot limits to create padding for labels
+    # This is the most critical fix to prevent clipping.
+    x_coords = [p[0] for p in pos.values()]
+    y_coords = [p[1] for p in pos.values()]
+    ax.set_xlim(min(x_coords) - 1, max(x_coords) + 1)
+    ax.set_ylim(min(y_coords) - 1, max(y_coords) + 1)
+    
+    # Hide the axis borders
     plt.axis('off')
+    
+    # Adjust layout to prevent title/legend overlap
     plt.tight_layout()
 
-    # Show and restore
+    # --- 4. Save and Display ---
+    output_file = "vlan_path_visualization.png"
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"\n[INFO] Visualization saved to {output_file}")
+    
     plt.show(block=True)
     plt.ion()
-
 
 def main():
     initial_switch = "172.17.57.243"  # Example starting switch IP
     target_port = "GigabitEthernet1/0/10"
-    vlan_id = "5"
+    vlan_id = "909"
     
     # Correct unpacking of all 4 return values
     success, message, path, results = verify_vlan_path(
