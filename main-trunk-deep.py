@@ -88,7 +88,10 @@ def find_uplink_port(task: Task, neighbor_ip: str) -> Optional[str]:
     return None
 
 def verify_vlan_exists(task: Task, vlan_id: str) -> bool:
-    """Check if VLAN exists in database (vendor-neutral)"""
+    """
+    Check if VLAN exists in database (vendor-neutral) with robust
+    error checking.
+    """
     platform = task.host.platform
     
     try:
@@ -104,9 +107,25 @@ def verify_vlan_exists(task: Task, vlan_id: str) -> bool:
             use_textfsm=True,
             enable=True
         )
-        print(f"[DEBUG] VLAN check result on {task.host}: {result.result}")
         
-        return bool(result.result)
+        result_data = result.result
+        print(f"[DEBUG] VLAN check result on {task.host}: {result_data}")
+        
+        # FIX: Check the type and content of the result
+        
+        # Case 1: TextFSM parsed successfully, returning a list.
+        # An empty list means the VLAN was not found.
+        if isinstance(result_data, list):
+            return bool(result_data) # bool([]) is False, which is correct.
+
+        # Case 2: TextFSM failed, returning a string.
+        # We must check the string for failure messages.
+        if isinstance(result_data, str):
+            if "not found" in result_data.lower() or "unrecognized" in result_data.lower():
+                return False # Explicitly return False if an error message is found.
+        
+        # Case 3: Any other result (None, empty string, etc.) is a failure.
+        return False
     
     except Exception as e:
         print(f"[ERROR] Error checking VLAN on {task.host}: {str(e)}")
