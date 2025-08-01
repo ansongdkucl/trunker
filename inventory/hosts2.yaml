@@ -1,0 +1,14 @@
+172.17.52.18:
+  hostname: 172.17.52.18
+  port: 22
+  plaform: cisco-ios
+  groups:
+      - switches
+  data:
+      router: cisco-sw
+      building: 444
+      cab: 9
+ 
+      
+
+ #28:de:65:23:4d:82 

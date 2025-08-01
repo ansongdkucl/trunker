@@ -1,0 +1,43 @@
+172.17.57.240:
+  hostname: 172.17.57.240
+  port: 22
+  platform: cisco_ios  # Corrected from 'plaform'
+  groups:
+    - switches
+  data:
+    building: 444
+    router: 
+    cab: 9
+
+172.17.57.241:
+  hostname: 172.17.57.241
+  port: 22
+  platform: cisco_ios  # Corrected from 'plaform'
+  groups:
+    - switches
+  data:
+    building: 444
+    router: 172.17.57.240
+    cab: 13 
+
+172.17.57.242:
+  hostname: 172.17.57.242
+  port: 22
+  platform: cisco_ios  # Added missing platform
+  groups:
+    - switches
+  data:
+    building: 444
+    router: 172.17.57.240
+    cab: 06
+      
+172.17.57.243:
+  hostname: 172.17.57.243
+  port: 22
+  platform: cisco_ios  # Corrected from 'plaform'
+  groups:
+    - switches
+  data:
+    building: 444
+    router: 172.17.57.240
+    cab: 0644

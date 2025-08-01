@@ -1,0 +1,20 @@
+---
+  switches:
+    data:
+      username: cceadan 
+      password: Ba2ham006868!!
+      connection_options:
+        napalm:
+          port: 22
+          platform: ios
+          extras:
+            optional_args:
+              secret: M!n1hulK
+              port: 22
+        netmiko:
+          port: 22
+          platform: cisco_ios
+          extras:
+            secret: M!n1hulK
+    
+  
