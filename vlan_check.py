@@ -2,493 +2,330 @@ from netmiko import ConnectHandler
 import re
 import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Set, Dict, Any, Optional
+from dataclasses import dataclass
 
-# Set up logging
+# =========================
+# Logging Setup
+# =========================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global variables
 DEBUG_FILE = "vlan_check_debug.log"
-SUPPRESS_RAW_OUTPUT = True  # Set to False if you need to see raw device outputs
+SUPPRESS_RAW_OUTPUT = True
+
+# =========================
+# Data Classes
+# =========================
+@dataclass
+class PathHop:
+    device_name: str
+    device_ip: str
+    local_interface: str
 
 # =========================
 # Helper Functions
 # =========================
 
 def log_debug(message: str, level='info'):
-    """Log messages with different levels."""
+    """Log to console + file."""
     if level == 'debug':
         logger.debug(message)
     else:
         logger.info(message)
-    
     with open(DEBUG_FILE, 'a') as f:
         f.write(f"{message}\n")
 
 def is_aruba(device_ip: str) -> bool:
-    """Determine if a device is Aruba based on IP or other criteria."""
-    # This is a simple implementation - you might want to enhance it
-    aruba_ips = ['10.17.10.190']  # Add known Aruba IPs here
-    return device_ip in aruba_ips
+    """Detect Aruba CX devices by IP range or naming."""
+    if device_ip.startswith("10.17.") or device_ip.startswith("172.22."):
+        return True
+    # hostname-based fallback if needed
+    aruba_patterns = [r'aruba-', r'tp-edge-']
+    for pattern in aruba_patterns:
+        if re.search(pattern, device_ip, re.IGNORECASE):
+            return True
+    return False
+
+def get_device_type(device_ip: str) -> str:
+    """Determine device type based on IP."""
+    return 'aruba_aoscx' if is_aruba(device_ip) else 'cisco_ios'
+
+def get_connection_params(device_ip: str, creds: dict) -> Optional[Dict[str, Any]]:
+    """Get connection parameters for a device."""
+    device_type = get_device_type(device_ip)
+    device_creds = creds.get("aruba" if device_type == 'aruba_aoscx' else "cisco", {})
+    
+    if not device_creds.get('username') or not device_creds.get('password'):
+        log_debug(f"❌ Missing credentials for {device_ip}")
+        return None
+    
+    params = {
+        'device_type': device_type,
+        'host': device_ip,
+        'username': device_creds.get('username'),
+        'password': device_creds.get('password'),
+        'secret': device_creds.get('secret', ''),
+        'timeout': 30,
+        'verbose': False
+    }
+    return params
+
+def get_connection(device_ip: str, creds: dict):
+    """Establish connection to device."""
+    params = get_connection_params(device_ip, creds)
+    if not params:
+        return None
+    
+    try:
+        connection = ConnectHandler(**params)
+        if params['device_type'] == 'cisco_ios' and params.get('secret'):
+            connection.enable()
+        return connection
+    except Exception as e:
+        log_debug(f"❌ Failed to connect to {device_ip}: {str(e)}")
+        return None
 
 def run_command(device_ip: str, command: str, creds: dict) -> str:
-    """
-    Execute a command on a network device using Netmiko.
+    """Run a command on a network device using Netmiko."""
+    connection = get_connection(device_ip, creds)
+    if not connection:
+        raise Exception(f"Failed to connect to {device_ip}")
     
-    Args:
-        device_ip: IP address of the device
-        command: Command to execute
-        creds: Device credentials
-    
-    Returns:
-        Command output as string
-    """
     try:
-        # Determine device type
-        device_type = 'aruba_os' if is_aruba(device_ip) else 'cisco_ios'
-        
-        # Get appropriate credentials
-        cred_key = 'aruba' if is_aruba(device_ip) else 'cisco'
-        device_creds = creds.get(cred_key, {})
-        
-        # Set up connection parameters
-        connection_params = {
-            'device_type': device_type,
-            'host': device_ip,
-            'username': device_creds.get('username'),
-            'password': device_creds.get('password'),
-            'secret': device_creds.get('secret', ''),
-            'timeout': 30,
-            'verbose': False
-        }
-        
-        # Connect and execute command
-        with ConnectHandler(**connection_params) as net_connect:
-            if device_creds.get('secret') and not is_aruba(device_ip):
-                net_connect.enable()
-            
-            output = net_connect.send_command(command)
-            return output
-            
+        return connection.send_command(command)
     except Exception as e:
-        error_msg = f"Failed to execute command on {device_ip}: {str(e)}"
-        log_debug(f"❌ {error_msg}", 'debug')
-        raise Exception(error_msg)
+        msg = f"❌ Failed to run '{command}' on {device_ip}: {str(e)}"
+        log_debug(msg)
+        raise Exception(msg)
+    finally:
+        connection.disconnect()
+
+def test_device_connectivity(device_ip: str, creds: dict) -> bool:
+    """Test login with creds and run 'show version'."""
+    connection = get_connection(device_ip, creds)
+    if not connection:
+        return False
+    
+    try:
+        connection.send_command("show version", delay_factor=2)
+        log_debug(f"✅ Connected to {device_ip}")
+        return True
+    except Exception as e:
+        log_debug(f"❌ Failed to test connectivity to {device_ip}: {str(e)}")
+        return False
+    finally:
+        connection.disconnect()
 
 # =========================
-# PathHop Class
+# VLAN + Trunk Parsing
 # =========================
 
-class PathHop:
-    """Class to represent a hop in the network path."""
-    def __init__(self, device_name: str, device_ip: str, local_interface: str):
-        self.device_name = device_name
-        self.device_ip = device_ip
-        self.local_interface = local_interface
+def parse_vlan_list(vlan_str: str) -> Set[int]:
+    """Expand Cisco VLAN list string (e.g. '2,5,10,20-22') into a set of ints."""
+    vlans = set()
+    for part in vlan_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            start, end = part.split('-')
+            try:
+                vlans.update(range(int(start), int(end) + 1))
+            except ValueError:
+                continue
+        elif part.isdigit():
+            vlans.add(int(part))
+    return vlans
+
+def get_vlan_database(ip: str, creds: dict) -> Set[int]:
+    """Retrieve VLAN database (all configured VLANs) for Cisco or Aruba."""
+    connection = get_connection(ip, creds)
+    if not connection:
+        return set()
+
+    try:
+        device_type = get_device_type(ip)
+        vlans = set()
+        
+        if device_type == "cisco_ios":
+            output = connection.send_command("show vlan brief")
+            for line in output.splitlines():
+                match = re.match(r"^\s*(\d+)\s+\S+\s+(active|act/unsup)", line, re.IGNORECASE)
+                if match:
+                    vlans.add(int(match.group(1)))
+        
+        elif device_type == "aruba_aoscx":
+            output = connection.send_command("show vlan")
+            for line in output.splitlines():
+                match = re.match(r"^\s*(\d+)\s", line)
+                if match:
+                    vlans.add(int(match.group(1)))
+        
+        return vlans
+
+    except Exception as e:
+        log_debug(f"❌ Failed to get VLAN database from {ip}: {str(e)}")
+        return set()
+    finally:
+        connection.disconnect()
+
+def get_trunk_vlans(ip: str, interface: str, creds: dict) -> Set[int]:
+    """Return VLANs allowed on trunk for Cisco or Aruba devices."""
+    connection = get_connection(ip, creds)
+    if not connection:
+        return set()
+
+    try:
+        device_type = get_device_type(ip)
+        
+        if device_type == "cisco_ios":
+            # Use the general trunk command
+            output = connection.send_command("show interfaces trunk")
+            log_debug(f"Raw trunk output for {ip}:\n{output}", 'debug')
+            
+            vlans_allowed = set()
+            lines = output.splitlines()
+            
+            # Convert interface name to short format (e.g., "TenGigabitEthernet1/1/4" -> "Te1/1/4")
+            interface_short = interface.replace("TenGigabitEthernet", "Te").replace("GigabitEthernet", "Gi").replace("FastEthernet", "Fa")
+            
+            # Look for the "Vlans allowed on trunk" section
+            for i, line in enumerate(lines):
+                if "vlans allowed on trunk" in line.lower():
+                    # Check the next few lines for our interface
+                    for j in range(i + 1, min(i + 10, len(lines))):
+                        next_line = lines[j].strip()
+                        if next_line and not next_line.startswith("Port"):
+                            # Check if this line starts with our interface name (short format)
+                            if next_line.lower().startswith(interface_short.lower()):
+                                # Extract the VLAN list (everything after the interface name)
+                                vlan_part = next_line[len(interface_short):].strip()
+                                # The VLAN list should be the first element
+                                vlan_str = vlan_part.split()[0] if vlan_part.split() else ""
+                                log_debug(f"DEBUG: Found VLAN string for {interface_short}: '{vlan_str}'", 'debug')
+                                vlans_allowed.update(parse_vlan_list(vlan_str))
+                                break
+                    break
+            
+            return vlans_allowed
+
+        elif device_type == "aruba_aoscx":
+            output = connection.send_command(f"show vlan port {interface}")
+            vlans = set()
+            for line in output.splitlines():
+                match = re.match(r"^\s*(\d+)\s+\S+", line)
+                if match:
+                    vlans.add(int(match.group(1)))
+            return vlans
+
+    except Exception as e:
+        log_debug(f"❌ Failed to get trunk VLANs from {ip} interface {interface}: {str(e)}")
+        return set()
+    finally:
+        connection.disconnect()
 
 # =========================
-# VLAN Database and Trunk Checker
+# VLAN Path Consistency Check
 # =========================
 
-def check_vlan_on_path(path: List[PathHop], vlan_id: int, creds: dict) -> dict:
-    """
-    Check if a VLAN exists in the database and on trunk uplinks throughout the network path.
-    
-    Args:
-        path: List of PathHop objects representing the network path
-        vlan_id: VLAN ID to check (integer)
-        creds: Dictionary containing device credentials
-    
-    Returns:
-        Dictionary with detailed VLAN status information for each device
-    """
-    vlan_status = {
-        'vlan_id': vlan_id,
-        'devices': [],
-        'summary': {
-            'total_devices': 0,
-            'vlan_in_database': 0,
-            'trunk_configured': 0,
-            'vlan_on_trunk': 0,
-            'issues_found': []
-        }
-    }
-    
-    log_debug(f"\n🔍 Checking VLAN {vlan_id} on network path...")
-    
+def check_vlan_consistency(path: List[PathHop], vlan: int, creds: dict):
+    """Check if VLAN is consistently present/allowed along a path."""
+    results = []
+    consistent = True
+
     for hop in path:
-        if not hop.device_ip or not hop.local_interface:
-            continue
-            
-        device_status = {
-            'device_name': hop.device_name,
-            'device_ip': hop.device_ip,
-            'local_interface': hop.local_interface,
-            'vlan_in_database': False,
-            'interface_is_trunk': False,
-            'vlan_on_trunk': False,
-            'vlan_database_info': '',
-            'trunk_info': '',
-            'issues': []
+        vlans_db = get_vlan_database(hop.device_ip, creds)
+        vlans_trunk = get_trunk_vlans(hop.device_ip, hop.local_interface, creds)
+
+        in_db = vlan in vlans_db
+        on_trunk = vlan in vlans_trunk
+
+        hop_result = {
+            "device": hop.device_name,
+            "ip": hop.device_ip,
+            "interface": hop.local_interface,
+            "in_db": in_db,
+            "on_trunk": on_trunk,
+            "vlans_db": vlans_db,
+            "vlans_trunk": vlans_trunk
         }
+        results.append(hop_result)
+
+        if not (in_db and on_trunk):
+            consistent = False
+
+    return consistent, results
+
+def print_vlan_report(vlan: int, results: List[dict], consistent: bool):
+    """Print a readable VLAN report."""
+    print(f"\n=== VLAN {vlan} Consistency Report ===")
+    for r in results:
+        db_status = "✅" if r["in_db"] else "❌"
+        trunk_status = "✅" if r["on_trunk"] else "❌"
+        print(f"{r['device']} ({r['ip']}): DB={db_status}, Trunk[{r['interface']}]={trunk_status}")
         
-        log_debug(f"➡️ Checking {hop.device_name} ({hop.device_ip}) interface {hop.local_interface}")
-        
-        try:
-            # Check VLAN in database
-            vlan_db_status = check_vlan_database(hop.device_ip, vlan_id, creds)
-            device_status['vlan_in_database'] = vlan_db_status['exists']
-            device_status['vlan_database_info'] = vlan_db_status['info']
-            
-            if vlan_db_status['exists']:
-                vlan_status['summary']['vlan_in_database'] += 1
-                log_debug(f"✅ VLAN {vlan_id} found in database on {hop.device_name}", 'debug')
-            else:
-                device_status['issues'].append(f"VLAN {vlan_id} not in database")
-                vlan_status['summary']['issues_found'].append(f"{hop.device_name}: VLAN not in database")
-                log_debug(f"❌ VLAN {vlan_id} NOT found in database on {hop.device_name}", 'debug')
-            
-            # Check trunk configuration and VLAN on trunk
-            trunk_status = check_trunk_interface(hop.device_ip, hop.local_interface, vlan_id, creds)
-            device_status['interface_is_trunk'] = trunk_status['is_trunk']
-            device_status['vlan_on_trunk'] = trunk_status['vlan_on_trunk']
-            device_status['trunk_info'] = trunk_status['info']
-            
-            if trunk_status['is_trunk']:
-                vlan_status['summary']['trunk_configured'] += 1
-                log_debug(f"✅ Interface {hop.local_interface} is configured as trunk on {hop.device_name}", 'debug')
-                
-                if trunk_status['vlan_on_trunk']:
-                    vlan_status['summary']['vlan_on_trunk'] += 1
-                    log_debug(f"✅ VLAN {vlan_id} is allowed on trunk {hop.local_interface}", 'debug')
-                else:
-                    device_status['issues'].append(f"VLAN {vlan_id} not allowed on trunk {hop.local_interface}")
-                    vlan_status['summary']['issues_found'].append(f"{hop.device_name}: VLAN not on trunk {hop.local_interface}")
-                    log_debug(f"❌ VLAN {vlan_id} NOT allowed on trunk {hop.local_interface}", 'debug')
-            else:
-                device_status['issues'].append(f"Interface {hop.local_interface} not configured as trunk")
-                vlan_status['summary']['issues_found'].append(f"{hop.device_name}: Interface {hop.local_interface} not trunk")
-                log_debug(f"❌ Interface {hop.local_interface} is NOT configured as trunk on {hop.device_name}", 'debug')
-                
-        except Exception as e:
-            error_msg = f"Error checking {hop.device_name}: {str(e)}"
-            device_status['issues'].append(error_msg)
-            vlan_status['summary']['issues_found'].append(error_msg)
-            log_debug(f"❌ {error_msg}", 'debug')
-        
-        vlan_status['devices'].append(device_status)
-        vlan_status['summary']['total_devices'] += 1
-    
-    # Generate summary report
-    log_debug(f"\n📊 VLAN {vlan_id} Status Summary:")
-    log_debug(f"Total devices checked: {vlan_status['summary']['total_devices']}")
-    log_debug(f"VLAN in database: {vlan_status['summary']['vlan_in_database']}/{vlan_status['summary']['total_devices']}")
-    log_debug(f"Trunk interfaces: {vlan_status['summary']['trunk_configured']}/{vlan_status['summary']['total_devices']}")
-    log_debug(f"VLAN on trunks: {vlan_status['summary']['vlan_on_trunk']}/{vlan_status['summary']['trunk_configured']}")
-    
-    if vlan_status['summary']['issues_found']:
-        log_debug(f"Issues found: {len(vlan_status['summary']['issues_found'])}")
-        for issue in vlan_status['summary']['issues_found']:
-            log_debug(f"  ⚠️ {issue}")
+        # Show available VLANs for debugging when there are issues
+        if not r["in_db"]:
+            print(f"  Available VLANs in DB: {sorted(r['vlans_db'])}")
+        if not r["on_trunk"]:
+            print(f"  VLANs allowed on trunk: {sorted(r['vlans_trunk'])}")
+
+    if consistent:
+        print(f"\n✅ VLAN {vlan} is consistently present across the entire path.")
     else:
-        log_debug("✅ No issues found - VLAN is properly configured throughout the path")
-    
-    return vlan_status
-
-
-def check_vlan_database(device_ip: str, vlan_id: int, creds: dict) -> dict:
-    """
-    Check if a VLAN exists in the device's VLAN database.
-    
-    Args:
-        device_ip: IP address of the device
-        vlan_id: VLAN ID to check
-        creds: Device credentials
-    
-    Returns:
-        Dictionary with VLAN database status
-    """
-    result = {'exists': False, 'info': '', 'raw_output': ''}
-    
-    try:
-        if is_aruba(device_ip):
-            # Aruba AOS-CX command
-            command = "show vlan"
-            output = run_command(device_ip, command, creds)
-            if not SUPPRESS_RAW_OUTPUT:
-                result['raw_output'] = output
-            
-            # Parse Aruba VLAN output
-            lines = output.split('\n')
-            for line in lines:
-                if line.strip().startswith(str(vlan_id)):
-                    parts = line.strip().split()
-                    if len(parts) >= 2 and parts[0] == str(vlan_id):
-                        vlan_name = parts[1] if len(parts) > 1 else "unnamed"
-                        result['exists'] = True
-                        result['info'] = f"VLAN {vlan_id} ({vlan_name}) exists"
-                        break
-        else:
-            # Cisco IOS command
-            command = f"show vlan id {vlan_id}"
-            output = run_command(device_ip, command, creds)
-            print(f'Command output for {device_ip}:\n{output}\n')  # Debug print
-            if not SUPPRESS_RAW_OUTPUT:
-                result['raw_output'] = output
-            
-            # Parse Cisco VLAN output
-            if "VLAN Name" in output and not ("not found" in output.lower() or "invalid" in output.lower()):
-                # Extract VLAN name
-                lines = output.split('\n')
-                for line in lines:
-                    if line.strip().startswith(str(vlan_id)):
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            vlan_name = parts[1]
-                            result['exists'] = True
-                            result['info'] = f"VLAN {vlan_id} ({vlan_name}) exists"
-                            break
-                        
-    except Exception as e:
-        result['info'] = f"Error checking VLAN database: {str(e)}"
-        log_debug(f"❌ Error checking VLAN database on {device_ip}: {e}", 'debug')
-    
-    return result
-
-
-def check_trunk_interface(device_ip: str, interface: str, vlan_id: int, creds: dict) -> dict:
-    """
-    Check if an interface is configured as a trunk and if a specific VLAN is allowed on it.
-    
-    Args:
-        device_ip: IP address of the device
-        interface: Interface name to check
-        vlan_id: VLAN ID to check on the trunk
-        creds: Device credentials
-    
-    Returns:
-        Dictionary with trunk status information
-    """
-    result = {
-        'is_trunk': False,
-        'vlan_on_trunk': False,
-        'info': '',
-        'allowed_vlans': [],
-        'raw_output': ''
-    }
-    
-    try:
-        if is_aruba(device_ip):
-            # Aruba AOS-CX commands
-            command = f"show interface {interface}"
-            output = run_command(device_ip, command, creds)
-            if not SUPPRESS_RAW_OUTPUT:
-                result['raw_output'] = output
-            
-            # Check if interface is in trunk mode
-            if "vlan_mode: trunk" in output.lower() or "mode: trunk" in output.lower():
-                result['is_trunk'] = True
-                result['info'] = f"Interface {interface} is configured as trunk"
-                
-                # Get VLAN information for the interface
-                vlan_command = f"show vlan port {interface}"
-                vlan_output = run_command(device_ip, vlan_command, creds)
-                
-                # Parse allowed VLANs (this may need adjustment based on actual Aruba output format)
-                if str(vlan_id) in vlan_output:
-                    result['vlan_on_trunk'] = True
-                    result['info'] += f", VLAN {vlan_id} is allowed"
-                else:
-                    result['info'] += f", VLAN {vlan_id} is NOT allowed"
-            else:
-                result['info'] = f"Interface {interface} is NOT configured as trunk"
-                
-        else:
-            # Cisco IOS commands
-            command = f"show interfaces {interface} switchport"
-            output = run_command(device_ip, command, creds)
-            if not SUPPRESS_RAW_OUTPUT:
-                result['raw_output'] = output
-            
-            # Check if interface is in trunk mode
-            if "Administrative Mode: trunk" in output or "Operational Mode: trunk" in output:
-                result['is_trunk'] = True
-                result['info'] = f"Interface {interface} is configured as trunk"
-                
-                # Extract allowed VLANs
-                allowed_vlans_match = re.search(r'Trunking VLANs Enabled: (.+)', output)
-                if allowed_vlans_match:
-                    allowed_vlans_str = allowed_vlans_match.group(1).strip()
-                    
-                    # Parse VLAN ranges and individual VLANs
-                    if "ALL" in allowed_vlans_str.upper():
-                        result['vlan_on_trunk'] = True
-                        result['info'] += f", ALL VLANs allowed (including {vlan_id})"
-                    else:
-                        # Parse specific VLAN lists and ranges
-                        vlan_allowed = parse_vlan_list(allowed_vlans_str, vlan_id)
-                        result['vlan_on_trunk'] = vlan_allowed
-                        if vlan_allowed:
-                            result['info'] += f", VLAN {vlan_id} is allowed"
-                        else:
-                            result['info'] += f", VLAN {vlan_id} is NOT allowed"
-                        result['allowed_vlans'] = allowed_vlans_str
-                else:
-                    result['info'] += ", could not determine allowed VLANs"
-            else:
-                result['info'] = f"Interface {interface} is NOT configured as trunk"
-                
-    except Exception as e:
-        result['info'] = f"Error checking trunk interface: {str(e)}"
-        log_debug(f"❌ Error checking trunk interface {interface} on {device_ip}: {e}", 'debug')
-    
-    return result
-
-
-def parse_vlan_list(vlan_string: str, target_vlan: int) -> bool:
-    """
-    Parse a VLAN list string and check if target VLAN is included.
-    Handles formats like: "1-10,20,30-40,50"
-    
-    Args:
-        vlan_string: String containing VLAN list
-        target_vlan: VLAN ID to search for
-    
-    Returns:
-        Boolean indicating if target VLAN is in the list
-    """
-    try:
-        vlan_parts = vlan_string.replace(' ', '').split(',')
-        
-        for part in vlan_parts:
-            if '-' in part:
-                # Handle range (e.g., "1-10")
-                start, end = map(int, part.split('-'))
-                if start <= target_vlan <= end:
-                    return True
-            else:
-                # Handle individual VLAN
-                if int(part) == target_vlan:
-                    return True
-        
-        return False
-    except (ValueError, AttributeError):
-        log_debug(f"⚠️ Could not parse VLAN string: {vlan_string}", 'debug')
-        return False
-
-
-def generate_final_report(vlan_status: dict):
-    """
-    Generate a clean final report for each host in the path.
-    
-    Args:
-        vlan_status: Dictionary with VLAN status information
-    """
-    vlan_id = vlan_status['vlan_id']
-    
-    print(f"\n{'='*60}")
-    print(f"FINAL REPORT: VLAN {vlan_id} PATH ANALYSIS")
-    print(f"{'='*60}")
-    
-    # Summary section
-    summary = vlan_status['summary']
-    print(f"\n📊 SUMMARY:")
-    print(f"  Total devices checked: {summary['total_devices']}")
-    print(f"  VLAN in database: {summary['vlan_in_database']}/{summary['total_devices']}")
-    print(f"  Trunk interfaces: {summary['trunk_configured']}/{summary['total_devices']}")
-    print(f"  VLAN on trunks: {summary['vlan_on_trunk']}/{summary['trunk_configured']}")
-    
-    if summary['issues_found']:
-        print(f"  ⚠️  Issues found: {len(summary['issues_found'])}")
-    else:
-        print(f"  ✅ No issues found")
-    
-    # Detailed device reports
-    print(f"\n📝 DETAILED DEVICE REPORTS:")
-    for device in vlan_status['devices']:
-        print(f"\n  Device: {device['device_name']} ({device['device_ip']})")
-        print(f"    Interface: {device['local_interface']}")
-        
-        # VLAN database status
-        vlan_db_status = "✅" if device['vlan_in_database'] else "❌"
-        print(f"    VLAN in database: {vlan_db_status} {device['vlan_database_info']}")
-        
-        # Trunk status
-        trunk_status = "✅" if device['interface_is_trunk'] else "❌"
-        print(f"    Trunk configured: {trunk_status} {device['trunk_info']}")
-        
-        # VLAN on trunk status (only if trunk is configured)
-        if device['interface_is_trunk']:
-            vlan_trunk_status = "✅" if device['vlan_on_trunk'] else "❌"
-            vlan_trunk_msg = "VLAN allowed on trunk" if device['vlan_on_trunk'] else "VLAN NOT allowed on trunk"
-            print(f"    {vlan_trunk_msg}: {vlan_trunk_status}")
-        
-        # Issues
-        if device['issues']:
-            print(f"    ⚠️  Issues:")
-            for issue in device['issues']:
-                print(f"      - {issue}")
-    
-    # Overall status
-    print(f"\n🎯 OVERALL STATUS:")
-    if not summary['issues_found']:
-        print("  ✅ SUCCESS: VLAN is properly configured throughout the path")
-    else:
-        print("  ❌ ISSUES DETECTED: VLAN configuration problems found")
-        print(f"\n  Recommended actions:")
-        for i, issue in enumerate(summary['issues_found'], 1):
-            print(f"    {i}. {issue}")
-    
-    print(f"\n{'='*60}")
-    print(f"Report complete. Detailed logs saved to: {DEBUG_FILE}")
-    print(f"{'='*60}")
-
+        print(f"\n❌ VLAN {vlan} is NOT consistent along the path.")
 
 # =========================
-# Main test execution
+# Main Execution
 # =========================
 if __name__ == "__main__":
-    # Clear previous debug file
+    # Reset debug log
     with open(DEBUG_FILE, 'w') as f:
         f.write("")
-    
-    # Test path as provided
+
+    # Example path
     #test_path = [
-     #   PathHop('ce9300-17-57-242', '172.17.57.242', 'TenGigabitEthernet1/1/4'),
-      #  PathHop('ce3650-17-57-241', '172.17.57.241', 'TenGigabitEthernet1/1/4'),
-       # PathHop('ce3650-17-57-240', '172.17.57.240', 'TenGigabitEthernet1/1/4'),
-        #PathHop('aruba-tp-edge-sw1-a', '10.17.10.190', '1/1/18')
-    #]#
+      #  PathHop('172.22.29.199', '172.22.29.199', '1/1/51'),
+       # PathHop('ce3650-17-57-240', '172.17.57.240', 'Te1/1/4'),
+       # PathHop('aruba-tp-edge-sw1-a', '10.17.10.86', '1/1/18')
+    #]
 
     test_path = [
-        PathHop('172.22.29.199', '172.22.29.199', '1/1/51'),
-        PathHop('ce3650-17-57-240', '172.17.57.240', 'TenGigabitEthernet1/1/4'),
-        PathHop('aruba-tp-edge-sw1-a', '10.17.10.190', '1/1/18')
-    ]
-    
-    # Credentials
+         PathHop('ce9300-17-57-243','172.17.57.243','Te1/0/2'),
+        PathHop('ce9300-17-57-242','172.17.57.242','Te1/1/3'),
+        PathHop('ce3650-17-57-241','172.17.57.241','Te1/1/4'),
+        PathHop('ce3650-17-57-240','172.17.57.240', 'Te1/1/4'),
+        PathHop('aruba-tp-edge-sw1-a','10.17.10.86','1/1/18')
+]
+
     creds = {
         "cisco": {
-            "username": os.environ.get("username"),
-            "password": os.environ.get("password"),
-            "secret": os.environ.get("secret"),
+            "username": os.environ.get("NET_USERNAME") or os.environ.get("username"),
+            "password": os.environ.get("NET_PASSWORD") or os.environ.get("password"),
+            "secret": os.environ.get("NET_SECRET") or os.environ.get("secret"),
         },
         "aruba": {
-            "username": os.environ.get("username"),
-            "password": os.environ.get("passwordAD"),
+            "username": os.environ.get("NET_USERNAME") or os.environ.get("username"),
+            "password": os.environ.get("NET_PASSWORD_AD") or os.environ.get("passwordAD"),
         }
     }
-    
-    # Test VLAN (change this to the VLAN you want to test)
-    test_vlan = 990
-    
-    log_debug("=== VLAN Check Test ===")
-    log_debug(f"Path: {[f'{hop.device_name}[{hop.local_interface}]' for hop in test_path]}")
-    log_debug(f"Testing VLAN: {test_vlan}")
-    
-    # Run the VLAN check
-    result = check_vlan_on_path(test_path, test_vlan, creds)
-    
-    # Generate and display final report
-    generate_final_report(result)
+
+    log_debug("=== CREDS DEBUG ===")
+    log_debug(f"Cisco user: {creds['cisco']['username']}")
+    log_debug(f"Aruba user: {creds['aruba']['username']}")
+    log_debug(f"Aruba pw set: {'Yes' if creds['aruba']['password'] else 'No'}")
+
+    log_debug("\n=== CONNECTIVITY TEST ===")
+    connectivity_results = {}
+    for hop in test_path:
+        connectivity_results[hop.device_ip] = test_device_connectivity(hop.device_ip, creds)
+
+    if not all(connectivity_results.values()):
+        print("❌ Connectivity issues detected:")
+        for ip, ok in connectivity_results.items():
+            print(f"  {ip}: {'✅ Reachable' if ok else '❌ NOT Reachable'}")
+        print("Fix issues before running VLAN check.")
+    else:
+        print("✅ All devices reachable — running VLAN consistency check...")
+        vlan_to_check = 990  # <-- set VLAN you want to check
+        consistent, results = check_vlan_consistency(test_path, vlan_to_check, creds)
+        print_vlan_report(vlan_to_check, results, consistent)
